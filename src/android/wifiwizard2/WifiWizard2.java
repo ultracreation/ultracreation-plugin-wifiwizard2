@@ -41,7 +41,10 @@ import android.net.wifi.WifiEnterpriseConfig;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.SupplicantState;
+import android.net.wifi.WifiNetworkSpecifier;
 import android.net.ConnectivityManager;
+import android.net.ConnectivityManager.NetworkCallback;
+import android.net.NetworkSpecifier;
 
 import android.content.Context;
 import android.os.AsyncTask;
@@ -89,9 +92,13 @@ public class WifiWizard2 extends CordovaPlugin {
   private static final int SCAN_RESULTS_CODE = 0; // Permissions request code for getScanResults()
   private static final int SCAN_CODE = 1; // Permissions request code for scan()
   private static final int LOCATION_REQUEST_CODE = 2; // Permissions request code
+  private static final int WIFI_SERVICE_INFO_CODE = 3;
   private static final String ACCESS_FINE_LOCATION = android.Manifest.permission.ACCESS_FINE_LOCATION;
 
   private static int LAST_NET_ID = -1;
+  // This is for when SSID or BSSID is requested but permissions have not been granted for location
+  // we store whether or not BSSID was requested, to recall the getWifiServiceInfo fn after permissions are granted
+  private static boolean bssidRequested = false;
 
   private WifiManager wifiManager;
   private CallbackContext callbackContext;
@@ -440,8 +447,41 @@ public class WifiWizard2 extends CordovaPlugin {
         wifi.priority = getMaxWifiPriority(wifiManager) + 1;
       }
 
-      // After processing authentication types, add or update network
-      if (wifi.networkId == -1) { // -1 means SSID configuration does not exist yet
+      if(API_VERSION >= 29) {
+        this.networkCallback = new ConnectivityManager.NetworkCallback() {
+          @Override
+          public void onAvailable(Network network) {
+            connectivityManager.bindProcessToNetwork(network);
+            Log.d(TAG, "WiFi connected");
+            callbackContext.success("WiFi connected");
+          }
+          @Override
+          public void onUnavailable() {
+           super.onUnavailable();
+           Log.d(TAG, "WiFi not available");
+           callbackContext.error("WiFi not available");
+          }
+        };
+
+        WifiNetworkSpecifier.Builder builder = new WifiNetworkSpecifier.Builder();
+        builder.setSsid(newSSID);
+        builder.setWpa2Passphrase(newPass);
+
+        WifiNetworkSpecifier wifiNetworkSpecifier = builder.build();
+
+        NetworkRequest.Builder networkRequestBuilder1 = new NetworkRequest.Builder();
+        networkRequestBuilder1.addTransportType(NetworkCapabilities.TRANSPORT_WIFI);
+        //removeCapability added for hotspots without internet
+        networkRequestBuilder1.removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        networkRequestBuilder1.setNetworkSpecifier(wifiNetworkSpecifier);
+
+        NetworkRequest nr = networkRequestBuilder1.build();
+        ConnectivityManager cm = (ConnectivityManager) cordova.getActivity().getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+        //timeout add because "No devices found" wasn't handled correct and doesn't throw Unavailable
+        cm.requestNetwork(nr, this.networkCallback, 15000);
+      } else {
+        // After processing authentication types, add or update network
+        if(wifi.networkId == -1) { // -1 means SSID configuration does not exist yet
 
         int newNetId = wifiManager.addNetwork(wifi);
         if( newNetId > -1 ){
@@ -460,6 +500,7 @@ public class WifiWizard2 extends CordovaPlugin {
           callbackContext.error( "ERROR_UPDATING_NETWORK" );
         }
 
+        }
       }
 
       // WifiManager configurations are presistent for API 26+
@@ -802,34 +843,46 @@ public class WifiWizard2 extends CordovaPlugin {
       return false;
     }
 
-    int networkIdToDisconnect = ssidToNetworkId(ssidToDisconnect);
+    if(API_VERSION < 29) {
+        int networkIdToDisconnect = ssidToNetworkId(ssidToDisconnect);
 
-    if (networkIdToDisconnect > 0) {
+        if (networkIdToDisconnect > 0) {
 
-      if( wifiManager.disableNetwork(networkIdToDisconnect) ){
+          if( wifiManager.disableNetwork(networkIdToDisconnect) ){
 
-        maybeResetBindALL();
+            maybeResetBindALL();
 
-        // We also remove the configuration from the device (use "disable" to keep config)
-        if( wifiManager.removeNetwork(networkIdToDisconnect) ){
-          callbackContext.success("Network " + ssidToDisconnect + " disconnected and removed!");
+            // We also remove the configuration from the device (use "disable" to keep config)
+            if( wifiManager.removeNetwork(networkIdToDisconnect) ){
+              callbackContext.success("Network " + ssidToDisconnect + " disconnected and removed!");
+            } else {
+              callbackContext.error("DISCONNECT_NET_REMOVE_ERROR");
+              Log.d(TAG, "WifiWizard2: Unable to remove network!");
+              return false;
+            }
+
+          } else {
+            callbackContext.error("DISCONNECT_NET_DISABLE_ERROR");
+            Log.d(TAG, "WifiWizard2: Unable to disable network!");
+            return false;
+          }
+
+          return true;
         } else {
-          callbackContext.error("DISCONNECT_NET_REMOVE_ERROR");
-          Log.d(TAG, "WifiWizard2: Unable to remove network!");
+          callbackContext.error("DISCONNECT_NET_ID_NOT_FOUND");
+          Log.d(TAG, "WifiWizard2: Network not found to disconnect.");
           return false;
         }
-
-      } else {
-        callbackContext.error("DISCONNECT_NET_DISABLE_ERROR");
-        Log.d(TAG, "WifiWizard2: Unable to disable network!");
-        return false;
-      }
-
-      return true;
     } else {
-      callbackContext.error("DISCONNECT_NET_ID_NOT_FOUND");
-      Log.d(TAG, "WifiWizard2: Network not found to disconnect.");
-      return false;
+      try {
+          ConnectivityManager cm = (ConnectivityManager) cordova.getActivity().getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+          cm.unregisterNetworkCallback(this.networkCallback);
+          connectivityManager.bindProcessToNetwork(null);
+          return true;
+        } catch(Exception e) {
+          callbackContext.error(e.getMessage());
+          return false;
+        }
     }
   }
 
@@ -842,13 +895,26 @@ public class WifiWizard2 extends CordovaPlugin {
   private boolean disconnect(CallbackContext callbackContext) {
     Log.d(TAG, "WifiWizard2: disconnect entered.");
 
-    if (wifiManager.disconnect()) {
-      maybeResetBindALL();
-      callbackContext.success("Disconnected from current network");
-      return true;
-    } else {
-      callbackContext.error("ERROR_DISCONNECT");
-      return false;
+    if (API_VERSION < 29) {
+      if (wifiManager.disconnect()) {
+        maybeResetBindALL();
+        callbackContext.success("Disconnected from current network");
+        return true;
+      } else {
+        callbackContext.error("ERROR_DISCONNECT");
+        return false;
+      }
+    }
+    else {
+      try {
+        ConnectivityManager cm = (ConnectivityManager) cordova.getActivity().getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+        cm.unregisterNetworkCallback(this.networkCallback);
+        connectivityManager.bindProcessToNetwork(null);
+        return true;
+      } catch(Exception e) {
+        callbackContext.error(e.getMessage());
+        return false;
+      }
     }
   }
 
@@ -987,9 +1053,9 @@ public class WifiWizard2 extends CordovaPlugin {
             lvl.put("centerFreq0", scan.centerFreq0);
             lvl.put("centerFreq1", scan.centerFreq1);
           } else {
-            lvl.put("channelWidth", null);
-            lvl.put("centerFreq0", null);
-            lvl.put("centerFreq1", null);
+            lvl.put("channelWidth", JSONObject.NULL);
+            lvl.put("centerFreq0", JSONObject.NULL);
+            lvl.put("centerFreq1", JSONObject.NULL);
           }
 
           returnList.put(lvl);
@@ -1129,41 +1195,46 @@ public class WifiWizard2 extends CordovaPlugin {
    * @param basicIdentifier A flag to get BSSID if true or SSID if false.
    * @return true if SSID found, false if not.
    */
-  private boolean getWifiServiceInfo(CallbackContext callbackContext, boolean basicIdentifier) {
-
-    WifiInfo info = wifiManager.getConnectionInfo();
-
-    if (info == null) {
-      callbackContext.error("UNABLE_TO_READ_WIFI_INFO");
-      return false;
-    }
-
-    // Only return SSID or BSSID when actually connected to a network
-    SupplicantState state = info.getSupplicantState();
-    if (!state.equals(SupplicantState.COMPLETED)) {
-      callbackContext.error("CONNECTION_NOT_COMPLETED");
-      return false;
-    }
-
-    String serviceInfo;
-    if (basicIdentifier) {
-      serviceInfo = info.getBSSID();
+  private boolean getWifiServiceInfo(CallbackContext callbackContext, boolean basicIdentifier) {    
+    if (API_VERSION >= 23 && !cordova.hasPermission(ACCESS_FINE_LOCATION)) { //Android 9 (Pie) or newer
+      requestLocationPermission(WIFI_SERVICE_INFO_CODE);
+      bssidRequested = basicIdentifier;
+      return true;
     } else {
-      serviceInfo = info.getSSID();
-    }
+      WifiInfo info = wifiManager.getConnectionInfo();
 
-    if (serviceInfo == null || serviceInfo.isEmpty() || serviceInfo == "0x") {
-      callbackContext.error("WIFI_INFORMATION_EMPTY");
-      return false;
+      if (info == null) {
+        callbackContext.error("UNABLE_TO_READ_WIFI_INFO");
+        return false;
+      }
+  
+      // Only return SSID or BSSID when actually connected to a network
+      SupplicantState state = info.getSupplicantState();
+      if (!state.equals(SupplicantState.COMPLETED)) {
+        callbackContext.error("CONNECTION_NOT_COMPLETED");
+        return false;
+      }
+  
+      String serviceInfo;
+      if (basicIdentifier) {
+        serviceInfo = info.getBSSID();
+      } else {
+        serviceInfo = info.getSSID();
+      }
+  
+      if (serviceInfo == null || serviceInfo.isEmpty() || serviceInfo == "0x") {
+        callbackContext.error("WIFI_INFORMATION_EMPTY");
+        return false;
+      }
+  
+      // http://developer.android.com/reference/android/net/wifi/WifiInfo.html#getSSID()
+      if (serviceInfo.startsWith("\"") && serviceInfo.endsWith("\"")) {
+        serviceInfo = serviceInfo.substring(1, serviceInfo.length() - 1);
+      }
+  
+      callbackContext.success(serviceInfo);
+      return true;
     }
-
-    // http://developer.android.com/reference/android/net/wifi/WifiInfo.html#getSSID()
-    if (serviceInfo.startsWith("\"") && serviceInfo.endsWith("\"")) {
-      serviceInfo = serviceInfo.substring(1, serviceInfo.length() - 1);
-    }
-
-    callbackContext.success(serviceInfo);
-    return true;
   }
 
   /**
@@ -1290,7 +1361,7 @@ public class WifiWizard2 extends CordovaPlugin {
    */
   private boolean verifyWifiEnabled() {
 
-    Log.d(TAG, "WifiWizard2: verifyWifiEnabled entered.");
+    Log.d(TAG, "WifiWizard2: verifyWifiEnabled entered, api: " + API_VERSION);
 
     if (!wifiManager.isWifiEnabled()) {
 
@@ -1466,6 +1537,9 @@ public class WifiWizard2 extends CordovaPlugin {
       case LOCATION_REQUEST_CODE:
         callbackContext.success("PERMISSION_GRANTED");
         break;
+      case WIFI_SERVICE_INFO_CODE:
+        getWifiServiceInfo(callbackContext, bssidRequested);
+        break;
     }
 
   }
@@ -1596,6 +1670,8 @@ public class WifiWizard2 extends CordovaPlugin {
           // Verify the desired network ID is what we actually connected to
           if ( desired != null && info.getNetworkId() == desired.apId ) {
             onSuccessfulConnection();
+          } else {
+            Log.e(TAG, "Could not connect to the desired ssid: " + ssid);
           }
 
         }
