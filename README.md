@@ -4,3 +4,5 @@ WifiWizard2 enables Wifi management for both Android and iOS applications within
 
 This project is a fork of the [WifiWizard2](https://github.com/tripflex/WifiWizard2) plugin with fixes and updates.
 
+merged from related plugins:
+community-cordova-plugin-wifi-wizard(https://github.com/EYALIN/community-cordova-plugin-wifi-wizard.git)
